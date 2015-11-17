@@ -1245,6 +1245,79 @@ module type Github = sig
         end
     end
 
+  module RepoData
+    (SHA_Blob : SHA) (Blob : RAWDATA)
+    (SHA_Tree : SHA) (Tree : OBJECT)
+    (SHA_Commit : SHA) (Commit : OBJECT) :
+    sig
+      type link =
+        {
+          git  : Uri.t;
+          self : Uri.t;
+          html : Uri.t;
+        }
+
+      type _ obj =
+        | Blob : SHA_Blob.t -> [`Blob] obj
+        | Tree : SHA_Tree.t -> [`Tree] obj
+        | Commit : SHA_Commit.t -> [`Commit] obj
+
+      module type CONTENT =
+        sig
+          type ty
+          type t = ty obj
+
+          val size         : int
+          val name         : string
+          val user         : string
+          val repo         : string
+          val url          : Uri.t
+          val git_url      : Uri.t
+          val html_url     : Uri.t
+          val download_url : Uri.t option
+          val link         : link
+        end
+
+      module type FILE =
+        sig
+          include CONTENT
+
+          val content : unit -> string Monad.t
+        end
+
+      module type DIRECTORY =
+        sig
+          include CONTENT
+        end
+
+      module type SUBMODULE =
+        sig
+          include CONTENT
+
+          val submodule_git_url : Uri.t
+        end
+
+      module type SYMLINK =
+        sig
+          include CONTENT
+
+          val target : string list
+        end
+
+      type assoc = [`Assoc of (string * Yojson.Safe.json) list]
+      type lst = [`List of Yojson.Safe.json list]
+
+      type (_, _) atom =
+        | Content   : (assoc, (module CONTENT)) atom
+        | File      : (assoc, (module FILE)) atom
+        | Directory : (assoc, (module DIRECTORY)) atom
+        | Symlink   : (assoc, (module SYMLINK)) atom
+        | Submodule : (assoc, (module SUBMODULE)) atom
+        | List      : (lst,   (module CONTENT) list) atom
+
+      val make : ('json, 'a) atom -> 'json -> 'a
+    end
+
   (** The [Search] module exposes GitHub's
       {{:https://developer.github.com/v3/search/}search interfaces}. *)
   module Search : sig

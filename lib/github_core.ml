@@ -183,6 +183,9 @@ module Make(Time : Github_s.Time)(CL : Cohttp_lwt.Client) = struct
     let repo_branches ~user ~repo =
       Uri.of_string (Printf.sprintf "%s/repos/%s/%s/branches" api user repo)
 
+    let repo_contents ~user ~repo ~path =
+      Uri.of_string (Printf.sprintf "%s/repos/%s/%s/contents/%s" api user repo path)
+
     let repo_refs ?ty ~user ~repo =
       let suffix =
         match ty with
@@ -322,21 +325,21 @@ module Make(Time : Github_s.Time)(CL : Cohttp_lwt.Client) = struct
     let team_repos ~id =
       Uri.of_string (Printf.sprintf "%s/teams/%Ld/repos" api id)
 
-    let get_blobs ~owner ~repo ~sha =
+    let get_blobs ~user ~repo ~sha =
       Uri.of_string
-        (Printf.sprintf "%s/repos/%s/%s/git/blobs/%s" api owner repo sha)
+        (Printf.sprintf "%s/repos/%s/%s/git/blobs/%s" api user repo sha)
 
-    let post_blobs ~owner ~repo =
+    let post_blobs ~user ~repo =
       Uri.of_string
-        (Printf.sprintf "%s/repos/%s/%s/git/blobs" api owner repo)
+        (Printf.sprintf "%s/repos/%s/%s/git/blobs" api user repo)
 
-    let get_commits ~owner ~repo ~sha =
+    let get_commits ~user ~repo ~sha =
       Uri.of_string
-        (Printf.sprintf "%s/repos/%s/%s/git/commits/%s" api owner repo sha)
+        (Printf.sprintf "%s/repos/%s/%s/git/commits/%s" api user repo sha)
 
-    let post_commits ~owner ~repo =
+    let post_commits ~user ~repo =
       Uri.of_string
-        (Printf.sprintf "%s/repos/%s/%s/git/commits" api owner repo)
+        (Printf.sprintf "%s/repos/%s/%s/git/commits" api user repo)
   end 
 
   module C = Cohttp
@@ -1669,45 +1672,45 @@ module Make(Time : Github_s.Time)(CL : Cohttp_lwt.Client) = struct
     type t
   end
 
+  module Encoding =
+    struct
+      type t =
+      [ `Base64
+      | `Utf8 ]
+
+      let sanitize x =
+        let result = Buffer.create (String.length x) in
+        for i = 0 to String.length x - 1 do
+          if String.unsafe_get x i >= '\000' && String.unsafe_get x i <= '\031'
+             || String.unsafe_get x i = '\127'
+          then () (* ignore CTLs characters *)
+          else Buffer.add_char result (String.unsafe_get x i)
+        done;
+        Buffer.contents result
+
+      let encode ~encoding content = match encoding with
+        | `Base64 -> B64.encode content
+        | `Utf8 -> content
+
+      let decode ~encoding content = match encoding with
+        | `Base64 -> sanitize content |> B64.decode
+        | `Utf8 -> content
+
+      let of_string = function
+        | "base64" -> `Base64
+        | "utf-8" -> `Utf8
+        | _ -> raise (Invalid_argument "Encoding.of_string")
+
+      let to_string = function
+        | `Base64 -> "base64"
+        | `Utf8 -> "utf-8"
+    end
+
   module GitData
     (SHA_Blob : SHA) (Blob : RAWDATA)
     (SHA_Tree : SHA) (Tree : OBJECT)
     (SHA_Commit : SHA) (Commit : OBJECT)= struct
     open Lwt
-
-    module Encoding =
-      struct
-        type t =
-        [ `Base64
-        | `Utf8 ]
-
-        let sanitize x =
-          let result = Buffer.create (String.length x) in
-          for i = 0 to String.length x - 1 do
-            if String.unsafe_get x i >= '\000' && String.unsafe_get x i <= '\031'
-               || String.unsafe_get x i = '\127'
-            then () (* ignore CTLs characters *)
-            else Buffer.add_char result (String.unsafe_get x i)
-          done;
-          Buffer.contents result
-
-        let encode ~encoding content = match encoding with
-          | `Base64 -> B64.encode content
-          | `Utf8 -> content
-
-        let decode ~encoding content = match encoding with
-          | `Base64 -> sanitize content |> B64.decode
-          | `Utf8 -> content
-
-        let of_string = function
-          | "base64" -> `Base64
-          | "utf-8" -> `Utf8
-          | _ -> raise (Invalid_argument "Encoding.of_string")
-
-        let to_string = function
-          | `Base64 -> "base64"
-          | `Utf8 -> "utf-8"
-      end
 
     module Blob = struct
       type t =
@@ -1807,6 +1810,249 @@ module Make(Time : Github_s.Time)(CL : Cohttp_lwt.Client) = struct
         API.post ?token ~uri ~expected_code:`Created
           ~body (fun b -> return (unsafe_commit_of_string b))
     end
+  end
+
+  module RepoData
+    (SHA_Blob : SHA) (Blob : RAWDATA)
+    (SHA_Tree : SHA) (Tree : OBJECT)
+    (SHA_Commit : SHA) (Commit : OBJECT) = struct
+    open Lwt
+
+    type link =
+      {
+        git  : Uri.t;
+        self : Uri.t;
+        html : Uri.t;
+      }
+
+    type ty =
+      | File
+      | Directory
+      | Symlink
+      | Submodule
+
+    let ty_of_string = function
+      | "file" -> File
+      | "dir" -> Directory
+      | "symlink" -> Symlink
+      | "submodule" -> Submodule
+      | _ -> raise (Invalid_argument "ty_of_string")
+
+    let split =
+      let re = '/' |> Re.char |> Re.compile in
+      fun path -> path
+        |> Re.split_full re
+        |> List.fold_left
+           (fun acc -> function `Text s -> s :: acc | `Delim _ -> acc) []
+        |> List.rev
+
+    type assoc = [`Assoc of (string * Yojson.Safe.json) list]
+    type lst = [`List of Yojson.Safe.json list]
+
+    module Json =
+      struct
+        exception Parse_error of string
+
+        let find (json : [< assoc]) path : [> Yojson.Safe.json] =
+          let rec aux (json : [< assoc]) path : [> Yojson.Safe.json] =
+            match path, json with
+            | [], json -> (json :> Yojson.Safe.json)
+            | [ x ], `Assoc json -> List.assoc x json
+            | x :: r, `Assoc json ->
+              (match List.assoc x json with
+               | `Assoc _ as json' -> aux json' r
+               | _ -> raise Not_found)
+          in aux json path
+
+        let get_string = function
+          | `String s -> s
+          | _ -> raise (Parse_error "expected string")
+
+        let get_uri x = get_string x |> Uri.of_string
+
+        let get_opt get = function
+          | `Null -> None
+          | x -> Some (get x)
+
+        let get_int = function
+          | `Int i -> i
+          | _ -> raise (Parse_error "expected string")
+
+        let get_list = function
+          | `List l -> (l :> Yojson.Safe.json list)
+      end
+
+    type _ obj =
+      | Blob : SHA_Blob.t -> [`Blob] obj
+      | Tree : SHA_Tree.t -> [`Tree] obj
+      | Commit : SHA_Commit.t -> [`Commit] obj
+
+    module type CONTENT =
+      sig
+        type ty
+        type t = ty obj
+
+        val size         : int
+        val name         : string
+        val user         : string
+        val repo         : string
+        val url          : Uri.t
+        val git_url      : Uri.t
+        val html_url     : Uri.t
+        val download_url : Uri.t option
+        val link         : link
+      end
+
+    module type FILE =
+      sig
+        include CONTENT
+
+        val content : unit -> string Monad.t
+      end
+
+    module type DIRECTORY =
+      sig
+        include CONTENT
+      end
+
+    module type SUBMODULE =
+      sig
+        include CONTENT
+
+        val submodule_git_url : Uri.t
+      end
+
+    module type SYMLINK =
+      sig
+        include CONTENT
+
+        val target : string list
+      end
+
+    let content (type a) (obj : a obj) (json : [< assoc]) =
+      let module M = struct
+        type ty = a
+        type t = ty obj
+
+        let size         = Json.find json ["size"] |> Json.get_int
+        let name         = Json.find json ["name"] |> Json.get_string
+        let url          = Json.find json ["url"] |> Json.get_uri
+        let user         = Uri.path url |> split |> fun lst -> List.nth lst 1
+        let repo         = Uri.path url |> split |> fun lst -> List.nth lst 2
+        let git_url      = Json.find json ["git_url"] |> Json.get_uri
+        let html_url     = Json.find json ["html_url"] |> Json.get_uri
+        let download_url = Json.find json ["download_url"] |> Json.get_opt Json.get_uri
+        let link         =
+          { git          = Json.find json ["_links"; "git"] |> Json.get_uri;
+            self         = Json.find json ["_links"; "self"] |> Json.get_uri;
+            html         = Json.find json ["_links"; "html"] |> Json.get_uri; }
+        let path         = Json.find json ["path"] |> Json.get_string |> split
+      end
+      in (module M : CONTENT)
+
+    let file (obj : [`Blob] obj) (json : [< assoc]) =
+      let Blob sha = obj in
+      let module C = (val content obj json) in
+      let module M = struct
+        include C
+
+        let content =
+          try
+            let encoding =
+              Json.find json ["encoding"]
+              |> Json.get_string
+              |> Encoding.of_string
+            in
+            Json.find json ["content"]
+            |> Json.get_string
+            |> Encoding.decode ~encoding
+            |> fun content -> (fun () x -> Monad.return content x)
+          with Not_found ->
+            (fun () x ->
+              Monad.(run (
+              let module GitData =
+                GitData(SHA_Blob)(Blob)
+                       (SHA_Tree)(Tree)
+                       (SHA_Commit)(Commit) in
+              GitData.Blob.get ~owner:user ~repo ~sha
+              >|= Response.value
+              >|= GitData.Blob.make
+              >|= (fun blob -> blob.GitData.Blob.content)))
+              |> fun content -> Monad.embed content x)
+      end
+      in (module M : FILE)
+
+    let directory (obj : [`Tree] obj) (json : [< assoc]) =
+      let Tree sha = obj in
+      let module C = (val content obj json) in
+      let module M = struct
+        include C
+      end
+      in (module M : DIRECTORY)
+
+    let submodule (obj : [`Blob] obj) (json : [< assoc]) =
+      let Blob sha = obj in
+      let module C = (val content obj json) in
+      let module M = struct
+        include C
+
+        let submodule_git_url =
+          Json.find json ["submodule_git_url"] |> Json.get_uri
+      end
+      in (module M : SUBMODULE)
+
+    let symlink (obj : [`Blob] obj) (json : [< assoc]) =
+      let Blob sha = obj in
+      let module C = (val content obj json) in
+      let module M = struct
+        include C
+
+        let target =
+          Json.find json ["target"] |> Json.get_string |> split
+      end
+      in (module M : SYMLINK)
+
+    type (_, _) atom =
+      | Content   : (assoc, (module CONTENT)) atom
+      | File      : (assoc, (module FILE)) atom
+      | Directory : (assoc, (module DIRECTORY)) atom
+      | Symlink   : (assoc, (module SYMLINK)) atom
+      | Submodule : (assoc, (module SUBMODULE)) atom
+      | List      : (lst,   (module CONTENT) list) atom
+
+    let rec make : type json a. (json, a) atom -> json -> a =
+      fun expected json ->
+      let sha = fun json -> Json.find json ["sha"] |> Json.get_string in
+      match expected with
+      | File ->
+        let sha = sha json |> SHA_Blob.of_hex in
+        file (Blob sha) json
+      | Directory ->
+        let sha = sha json |> SHA_Tree.of_hex in
+        directory (Tree sha) json
+      | Content ->
+        let sha = sha json |> SHA_Blob.of_hex in
+        content (Blob sha) json
+      | Submodule ->
+        let sha = sha json |> SHA_Blob.of_hex in
+        submodule (Blob sha) json
+      | Symlink ->
+        let sha = sha json |> SHA_Blob.of_hex in
+        symlink (Blob sha) json
+      | List ->
+        Json.get_list json
+        |> List.map
+          (function `Assoc _ as json' -> make Content json'
+                  | _ -> raise (Invalid_argument "atom"))
+
+    let get ?token ~user ~repo ?ref ~path =
+      let uri = URI.repo_contents ~user ~repo ~path in
+      let params = match ref with
+        | Some ref -> ["ref", ref; "path", path]
+        | None -> ["path", path]
+      in
+      API.get ?token ~uri ~expected_code:`OK ~params
+        (fun b -> return (json_of_string b))
   end
 
   module Search = struct

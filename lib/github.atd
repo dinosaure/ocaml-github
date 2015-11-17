@@ -977,3 +977,26 @@ type new_commit = {
   ?committer : info option;
   ?author    : info option;
 } <ocaml field_prefix="new_commit_">
+
+type _link = {
+  git          : string;
+  html         : string;
+  self         : string;
+}
+
+type unsafe_content = {
+  ty <json name="type"> : string;
+  encoding     : string;
+  size         : int;
+  name         : string;
+  path         : string;
+  content      : string;
+  sha          : string;
+  url          : string;
+  git_url      : string;
+  html_url     : string;
+  download_url : string option;
+  _link        : _link;
+} <ocaml field_prefix="unsafe_content_">
+
+type json <ocaml module="Yojson.Safe"> = abstract
